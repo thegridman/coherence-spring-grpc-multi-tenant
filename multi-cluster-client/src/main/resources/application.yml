@@ -1,0 +1,9 @@
+debug: false
+coherence:
+  server:
+    startup-timeout: 5m
+
+logging:
+  level:
+    com.oracle.coherence: INFO
+    root: INFO

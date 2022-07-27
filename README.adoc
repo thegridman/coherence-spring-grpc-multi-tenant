@@ -1,0 +1,213 @@
+= Multi-Tenant Coherence gRPC and Spring Example
+
+The example application is a web-server that gets data to service requests from a specific Coherence cluster depending on a header value in the http request. This demonstrates a simple multi-tenant web-server, where the tenant's data is segregated into different Coherence clusters.
+
+The default behaviour of the application is that it is also a Coherence cluster with caches to store meta-data about tenants.
+There are actually various ways that the application could be deployed: storage enabled cluster, storage disabled cluster members with separate storage, or clients of application cluster.
+Changing the deployment topology just requires changes at runtime or deployment time, there are no code changes required.
+
+
+== Build the Example Images
+
+The simplest way to run the example is to build the images and run the tenant clusters and application web-server
+in Docker containers. If the demo was run by just starting multiple JVMs on a laptop, there would need to be additional configuration to avoid conflicting ports. Running in containers makes this much simpler.
+
+The example Maven and build files contain tasks to pull together all the dependencies and Dockerfile into a directories
+named `multi-cluster-client/target/docker` and `multi-cluster-server/target/docker`
+
+The image can then be built by manually running the docker CLI from those directories,
+or by running a Maven command:
+
+*Using Docker:*
+
+[source,bash]
+----
+./mvnw clean package -DskipTests
+docker build -t ghcr.io/coherence-community/multi-cluster-client:latest multi-cluster-client/target/docker
+docker build -t ghcr.io/coherence-community/multi-cluster-server:latest multi-cluster-server/target/docker
+----
+
+
+*Using Maven:*
+
+[source,bash]
+----
+./mvnw clean package -DskipTests -P build-image
+----
+
+The command above will create two images, one for the example server and one for the client
+
+* Server image `ghcr.io/coherence-community/multi-cluster-server:latest`
+* Client image `ghcr.io/coherence-community/multi-cluster-client:latest`
+
+
+== Running the Example
+
+The point of this example is to show a client connecting to multiple clusters, so running the examples requires also running a number of Coherence clusters.
+To make running simple, each clusters will just be a single member.
+
+=== Create a Docker Network
+
+So that the client can communicate with the cluster members, a Docker network is required.
+The command below will create a Docker network named `coherence-net`
+
+[source,bash]
+----
+docker network create --driver bridge coherence-net
+----
+
+=== Start the Coherence Clusters
+
+This example will use two tenant clusters, one for each demo tenant, in this case "Marvel" and "Star Wars"
+
+Start the cluster for the Marvel tenant.
+
+[source,bash]
+----
+docker run -d --name marvel --network coherence-net \
+    -e COHERENCE_CLUSTER=marvel \
+    ghcr.io/coherence-community/multi-cluster-server:latest
+----
+
+Start the cluster for the Star Wars tenant.
+
+[source,bash]
+----
+docker run -d --name star-wars --network coherence-net \
+    -e COHERENCE_CLUSTER=star-wars \
+    ghcr.io/coherence-community/multi-cluster-server:latest
+----
+
+After starting all three clusters, the `docker ps` command can be used to check their status.
+Eventually the `STATUS` colum of each container should say `(healthy)`.
+
+[source]
+----
+CONTAINER ID   IMAGE                                                     COMMAND                  CREATED          STATUS                    PORTS                           NAMES
+923e84fa43d0   ghcr.io/coherence-community/multi-cluster-server:latest   "java -cp /app/class…"   38 seconds ago   Up 38 seconds (healthy)   1408/tcp, 9612/tcp, 20000/tcp   star-wars
+56d94b9eb083   ghcr.io/coherence-community/multi-cluster-server:latest   "java -cp /app/class…"   49 seconds ago   Up 48 seconds (healthy)   1408/tcp, 9612/tcp, 20000/tcp   marvel
+----
+
+=== Start the Application Web-Server
+
+When all the clusters are running and healthy, the multi-tenant client can be started using the command below.
+This will start the webserver and expose the endpoints on `http://127.0.0.1:8080`.
+
+[source,bash]
+----
+docker run -d --name webserver --network coherence-net \
+    -p 8080:8080 \
+    ghcr.io/coherence-community/multi-cluster-client:latest
+----
+
+Using `docker ps` the status of the `webserver` container should eventually be `(healthy)` too.
+
+==== Access the Spring Boot Health endpoint
+
+The web-server is a Spring Boot application, so it has the usual Spring Boot health http endpoint.
+The client example code includes a class named `CoherenceHealth` that integrates the Coherence built-in health checks
+into the Spring health checks.
+
+Using `curl` to access the health endpoint will tell us whether both Coherence and Spring are healthy,
+which should respond with `{"status":"UP"}`.
+
+[source,bash]
+----
+curl http://localhost:8080/actuator/health
+----
+
+
+
+=== Create the Tenant Meta-Data
+
+Once the `webserver` container is healthy the `/tenants` endpoint can be used to create the metadata for the two example tenants.
+This data will be stored in caches in the application JVMs.
+
+The curl command below will add the meta-data for the Marvel tenant. This will connect to the Marvel cluster using Coherence Extend on port 20000. The default extend proxy port in the server container is 20000.
+
+[source,bash]
+----
+curl -i -w '\n' -X POST http://127.0.0.1:8080/tenants \
+    -H 'Content-Type: application/json' \
+    -d '{"tenant":"marvel","type":"grpc","hostName":"marvel","port":1408,"serializer":"java"}'
+----
+
+This should return a 200 response
+
+The curl command below will add the meta-data for the Star Wars tenant. This will connect to the Star Wars cluster using Coherence gRPC API on port 1408. The default gRPC port in the server container is 1408.
+
+[source,bash]
+----
+curl -i -w '\n' -X POST http://127.0.0.1:8080/tenants \
+    -H 'Content-Type: application/json' \
+    -d '{"tenant":"star-wars","type":"grpc","hostName":"star-wars","port":1408,"serializer":"java"}'
+----
+
+This should return a 200 response.
+
+
+=== Access the Multi-Tenant Endpoints
+
+First, try a simple GET request without a tenant header value.
+
+[source,bash]
+----
+curl -i -w '\n' -X GET http://127.0.0.1:8080/users/foo
+----
+
+This should return a 400 bad request.
+
+Now try the same get, with a valid tenant identifier in the header.
+
+[source,bash]
+----
+curl -i -w '\n' -H 'tenant: marvel' -X GET http://127.0.0.1:8080/users/foo
+----
+
+This should return a 404, as no users have been created yet.
+
+Create a `User` in the Marvel cluster with the command below, using the `marvel` tenant identifier in the header:
+
+[source,bash]
+----
+curl -i -w '\n' -H 'tenant: marvel' -X POST http://127.0.0.1:8080/users \
+    -H 'Content-Type: application/json' \
+    -d '{"firstName":"Iron","lastName":"Man","email":"iron.man@marvel.com"}'
+----
+
+The response should be a 200 response, with the json of the user created.
+The application creates an id for the new user, the value of which will be the user's first name, followed by a dot,
+followed by the users last name, converted to lowercase.
+In the example above the user's id will be `"iron.man"`
+
+Now get the `iron.man` user from the Marvel cluster:
+
+[source,bash]
+----
+curl -i -w '\n' -H 'tenant: marvel' -X GET http://127.0.0.1:8080/users/iron.man
+----
+
+This should respond with a 200 response code and the same json as above.
+
+Next, try to get the `iron.man` user from the Star Wars cluster by using the `star-wars` tenant ID in the header
+
+[source,bash]
+----
+curl -i -w '\n' -H 'tenant: star-wars' -X GET http://127.0.0.1:8080/users/iron.man
+----
+
+The response should be a 404, not-found, as the `iron.man` user is not in the Star Wars tenant's cluster.
+
+
+
+At this point we could create more users for either of the Marvel or Star Wars tenants and see that they are separate from each other.
+
+==== Clean-Up
+
+The demo is complete so everything can be cleaned up.
+
+[source,bash]
+----
+docker rm -f webserver marvel star-wars
+docker network rm coherence-net
+----
